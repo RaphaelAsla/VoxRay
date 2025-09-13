@@ -1,0 +1,9 @@
+[submodule "libs/imgui"]
+	path = libs/imgui
+	url = https://github.com/ocornut/imgui.git
+[submodule "libs/tinybvh"]
+	path = libs/tinybvh
+	url = https://github.com/jbikker/tinybvh
+[submodule "libs/glm"]
+	path = libs/glm
+	url = https://github.com/g-truc/glm.git

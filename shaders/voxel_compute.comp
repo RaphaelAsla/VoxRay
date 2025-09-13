@@ -1,0 +1,274 @@
+#version 430 core
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+struct VoxelData {
+    vec4 normal_roughness;
+    vec4 albedo_emission;
+    ivec4 grid_position;
+};
+
+const uint MATERIAL_DIFFUSE = 0u;
+const uint MATERIAL_MIRROR = 1u;
+const uint MATERIAL_EMISSIVE = 2u;
+
+const float VOXEL_EXIT_OFFSET = 1.732; // sqrt(3) (exit from unit cube voxel, max diagonal distance)
+
+vec3 getVoxelAlbedo(VoxelData voxel) {
+    return voxel.albedo_emission.xyz;
+}
+
+vec3 getVoxelNormal(VoxelData voxel) {
+    return normalize(voxel.normal_roughness.xyz);
+}
+
+float getVoxelRoughness(VoxelData voxel) {
+    return voxel.normal_roughness.w;
+}
+
+float getVoxelEmission(VoxelData voxel) {
+    return voxel.albedo_emission.w;
+}
+
+uint getVoxelMaterial(VoxelData voxel) {
+    float emission = getVoxelEmission(voxel);
+    float roughness = getVoxelRoughness(voxel);
+
+    if (emission > 0.5) {
+        return MATERIAL_EMISSIVE;
+    } else if (roughness < 0.1) {
+        return MATERIAL_MIRROR;
+    } else {
+        return MATERIAL_DIFFUSE;
+    }
+}
+
+struct BVHNode {
+    vec3 aabb_min;
+    uint left_first;
+    vec3 aabb_max;
+    uint tri_count;
+};
+
+layout(std430, binding = 1) buffer VoxelBuffer {
+    VoxelData voxels[];
+};
+
+layout(std430, binding = 2) buffer ColorBuffer {
+    vec4 colors[];
+};
+
+layout(std430, binding = 3) buffer BVHBuffer {
+    BVHNode bvh_nodes[];
+};
+
+uniform float uTime;
+uniform ivec3 uGridSize;
+uniform int uFrameCount;
+uniform vec3 uCameraPosition;
+uniform bool uCameraMoving;
+
+uint hash(uint x) {
+    x += (x << 10u);
+    x ^= (x >> 6u);
+    x += (x << 3u);
+    x ^= (x >> 11u);
+    x += (x << 15u);
+    return x;
+}
+
+uint hash(uvec2 v) {
+    return hash(v.x ^ hash(v.y));
+}
+
+float random(inout uint seed) {
+    seed = hash(seed);
+    return float(seed) / float(0xFFFFFFFFu);
+}
+
+vec3 sampleHemisphere(vec3 normal, inout uint seed) {
+    float u1 = random(seed);
+    float u2 = random(seed);
+
+    float cos_theta = sqrt(u1);
+    float sin_theta = sqrt(1.0 - u1);
+    float phi = 2.0 * 3.14159265359 * u2;
+
+    // Create orthonormal basis
+    vec3 w = normal;
+    vec3 u = normalize(cross(abs(w.x) > 0.01 ? vec3(0, 1, 0) : vec3(1, 0, 0), w));
+    vec3 v = cross(w, u);
+
+    return normalize(u * sin_theta * cos(phi) + v * sin_theta * sin(phi) + w * cos_theta);
+}
+
+bool rayAABBIntersect(vec3 ray_origin, vec3 ray_dir, vec3 aabb_min, vec3 aabb_max, out float t_min, out float t_max) {
+    vec3 inv_dir = 1.0 / ray_dir;
+
+    vec3 t0s = (aabb_min - ray_origin) * inv_dir;
+    vec3 t1s = (aabb_max - ray_origin) * inv_dir;
+
+    vec3 t_smaller = min(t0s, t1s);
+    vec3 t_larger = max(t0s, t1s);
+
+    t_min = max(max(t_smaller.x, t_smaller.y), t_smaller.z);
+    t_max = min(min(t_larger.x, t_larger.y), t_larger.z);
+
+    return t_max >= max(t_min, 0.0);
+}
+
+bool traceVoxelBVH(vec3 ro, vec3 rd, out uint voxelIndex) {
+    const int MAX_STACK_SIZE = 16;
+    int stack[MAX_STACK_SIZE];
+    int stack_ptr = 0;
+    stack[stack_ptr++] = 0;
+
+    float closest_t = 1e30;
+    bool hit = false;
+
+    while (stack_ptr > 0) {
+        int node_index = stack[--stack_ptr];
+        BVHNode node = bvh_nodes[node_index];
+
+        float t_min, t_max;
+        if (!rayAABBIntersect(ro, rd, node.aabb_min, node.aabb_max, t_min, t_max)) continue;
+
+        if (t_min >= closest_t) continue;
+
+        if (node.tri_count > 0) {
+            if (t_min < closest_t && t_min > 0.0) {
+                closest_t = t_min;
+                voxelIndex = node.left_first;
+                hit = true;
+            }
+        } else {
+            int left_child = int(node.left_first);
+            int right_child = left_child + 1;
+
+            if (right_child >= 0 && stack_ptr < MAX_STACK_SIZE) stack[stack_ptr++] = right_child;
+            if (left_child >= 0 && stack_ptr < MAX_STACK_SIZE) stack[stack_ptr++] = left_child;
+        }
+    }
+
+    return hit;
+}
+
+vec3 traceBouncingRay(vec3 ray_origin, vec3 ray_direction, vec3 throughput, inout uint seed) {
+    vec3 radiance = vec3(0.0);
+    const int max_bounces = 2;
+
+    bool ray_active = true;
+
+    for (int bounce = 0; bounce < max_bounces; bounce++) {
+        if (!ray_active) continue;
+
+        uint hit_voxel_index;
+        bool hit = traceVoxelBVH(ray_origin, ray_direction, hit_voxel_index);
+
+        ray_active = ray_active && hit;
+
+        if (ray_active) {
+            VoxelData hit_voxel = voxels[hit_voxel_index];
+            vec3 hit_normal = getVoxelNormal(hit_voxel);
+            vec3 hit_albedo = getVoxelAlbedo(hit_voxel);
+            float hit_emission = getVoxelEmission(hit_voxel);
+
+            radiance += throughput * hit_albedo * hit_emission;
+
+            ray_active = ray_active && (hit_emission <= 0.0); // Stop if we hit light source
+
+            bool is_mirror = getVoxelMaterial(hit_voxel) == MATERIAL_MIRROR;
+
+            if (is_mirror) {} else {
+                throughput *= hit_albedo;
+            }
+
+            // Russian roulette
+            float max_throughput = max(throughput.x, max(throughput.y, throughput.z));
+            if (max_throughput < 0.3) {
+                ray_active = ray_active && (random(seed) < max_throughput / 0.3);
+                throughput /= max(0.01, max_throughput / 0.3);
+            }
+
+            vec3 voxel_center = vec3(hit_voxel.grid_position.xyz) + vec3(0.5);
+            ray_origin = voxel_center + hit_normal * VOXEL_EXIT_OFFSET;
+
+            if (is_mirror) {
+                ray_direction = reflect(ray_direction, hit_normal);
+            } else {
+                ray_direction = sampleHemisphere(hit_normal, seed);
+            }
+        }
+    }
+
+    return radiance;
+}
+
+vec3 traceMirrorReflection(vec3 ray_origin, vec3 ray_direction) {
+    // First bounce
+    uint first_hit_index;
+    bool first_hit = traceVoxelBVH(ray_origin, ray_direction, first_hit_index);
+    if (!first_hit || first_hit_index >= colors.length()) {
+        return vec3(0.0);
+    }
+
+    VoxelData first_hit_voxel = voxels[first_hit_index];
+
+    // If hit was mirror, do second bounce
+    if (getVoxelMaterial(first_hit_voxel) == MATERIAL_MIRROR) {
+        vec3 first_hit_pos = vec3(first_hit_voxel.grid_position.xyz) + vec3(0.5);
+        vec3 first_hit_normal = getVoxelNormal(first_hit_voxel);
+        vec3 second_reflection_dir = reflect(ray_direction, first_hit_normal);
+        vec3 second_ray_origin = first_hit_pos + first_hit_normal * VOXEL_EXIT_OFFSET;
+
+        uint second_hit_index;
+        bool second_hit = traceVoxelBVH(second_ray_origin, second_reflection_dir, second_hit_index);
+        if (second_hit && second_hit_index < colors.length()) {
+            return colors[second_hit_index].rgb;
+        }
+        return vec3(0.0);
+    }
+
+    return colors[first_hit_index].rgb;
+}
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (index >= voxels.length()) return;
+
+    VoxelData voxel = voxels[index];
+    vec3 voxel_pos = vec3(voxel.grid_position.xyz) + vec3(0.5);
+    vec3 voxel_normal = getVoxelNormal(voxel);
+    vec3 voxel_albedo = getVoxelAlbedo(voxel);
+    uint voxel_material = getVoxelMaterial(voxel);
+    float voxel_emission = getVoxelEmission(voxel);
+
+    vec3 previous_color = colors[index].rgb;
+    vec3 new_sample = vec3(0.0);
+
+    if (voxel_material == MATERIAL_EMISSIVE && voxel_emission > 0.0) {
+        new_sample = voxel_albedo * voxel_emission;
+    } else if (voxel_material == MATERIAL_MIRROR) {
+        vec3 view_dir = normalize(uCameraPosition - voxel_pos);
+        vec3 reflection_dir = reflect(-view_dir, voxel_normal);
+        vec3 ray_origin = voxel_pos + voxel_normal * VOXEL_EXIT_OFFSET;
+
+        new_sample = traceMirrorReflection(ray_origin, reflection_dir);
+    } else {
+        uint seed = hash(uvec2(index, uint(uFrameCount)));
+
+        vec3 ray_origin = voxel_pos + voxel_normal * VOXEL_EXIT_OFFSET;
+        vec3 ray_direction = sampleHemisphere(voxel_normal, seed);
+        vec3 throughput = voxel_albedo;
+
+        new_sample = traceBouncingRay(ray_origin, ray_direction, throughput, seed);
+        new_sample += voxel_albedo * 0.1;
+    }
+
+    if (voxel_material == MATERIAL_MIRROR) {
+        colors[index] = vec4(new_sample, 1.0);
+    } else {
+        float base_weight = 1.0 / max(float(uFrameCount), 1.0);
+        colors[index] = vec4(mix(previous_color, new_sample, base_weight), 1.0);
+    }
+}
